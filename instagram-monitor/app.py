@@ -63,32 +63,63 @@ def parse_count(text):
     mult={'k':1000,'m':1000000,'b':1000000000}.get((m.group(2) or '').lower(),1)
     return int(n*mult)
 
+def extract_stat(desc, labels):
+    if not desc: return None
+    for label in labels:
+        m=re.search(r'([\d,.]+(?:[KMB])?)\s+'+re.escape(label)+r'\b', desc, re.I)
+        if m: return parse_count(m.group(1))
+    return None
+
 def fetch_profile():
-    headers={"User-Agent":"Mozilla/5.0 (compatible; PublicAccountMonitor/1.0)"}
+    headers={"User-Agent":"Mozilla/5.0 (compatible; PublicAccountMonitor/1.1)"}
     r=requests.get(TARGET_URL,headers=headers,timeout=20,allow_redirects=True)
     r.raise_for_status()
     soup=BeautifulSoup(r.text,"html.parser")
     title=(soup.title.string if soup.title else "") or ""
     desc=""
     m=soup.find("meta",attrs={"name":"description"})
-    if m: desc=m.get("content","")
+    if m: desc=m.get("content","") or ""
     im=soup.find("meta",property="og:image")
     ogimg=im.get("content") if im else None
-    followers=following=posts=None
-    fm=re.search(r'([\d,.]+(?:[KMB])?)\s+Followers',desc,re.I)
-    pm=re.search(r'([\d,.]+(?:[KMB])?)\s+Posts',desc,re.I)
-    if fm: followers=parse_count(fm.group(1))
-    if pm: posts=parse_count(pm.group(1))
-    bio=desc[:500]
+
+    # Instagram sometimes exposes account stats in meta description/title, but formats vary.
+    followers=extract_stat(desc,["Followers"])
+    posts=extract_stat(desc,["Posts"])
+    following=extract_stat(desc,["Following"])
+
+    # Try structured metadata as a second public-only source.
+    for script in soup.find_all("script",type="application/ld+json"):
+        try:
+            obj=json.loads(script.string or script.get_text())
+            blobs=obj if isinstance(obj,list) else [obj]
+            for item in blobs:
+                if not isinstance(item,dict): continue
+                text=json.dumps(item)
+                if followers is None:
+                    followers=extract_stat(text,["Followers"])
+                if following is None:
+                    following=extract_stat(text,["Following"])
+                if posts is None:
+                    posts=extract_stat(text,["Posts"])
+                if ogimg is None and isinstance(item.get("image"),str):
+                    ogimg=item["image"]
+        except Exception:
+            pass
+
+    # Keep the bio separate from the metadata sentence where possible.
+    bio=desc[:1000].strip() if desc else ""
     links=set()
     for a in soup.find_all("a",href=True):
         href=a["href"]
         if re.search(r'^/(p|reel|tv)/[^/]+/?$',href):
             links.add(urljoin(TARGET_URL,href))
-    return {"username":TARGET,"url":TARGET_URL,"bio":bio,"followers":followers,
+
+    return {
+      "username":TARGET,"url":TARGET_URL,"bio":bio,"followers":followers,
       "following":following,"posts":posts,"profile_pic":ogimg,
       "discovered_posts":sorted(links),"title":title,"fetched_at":now(),
-      "source":"public Instagram profile page"}
+      "source":"public Instagram profile page"
+    }
 
 def last_snapshot(c):
     cur=c.cursor()
@@ -116,8 +147,10 @@ def scan():
                 insert_event(cur,"profile","Bio changed","Public bio content changed.",TARGET_URL)
             if pi != data["profile_pic"] and data["profile_pic"]:
                 insert_event(cur,"profile","Profile image changed","A different public profile image was detected.",TARGET_URL)
+
         q="INSERT INTO snapshots(scanned_at,username,bio,followers,following,posts,profile_pic,payload) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)" if DB_URL else "INSERT INTO snapshots(scanned_at,username,bio,followers,following,posts,profile_pic,payload) VALUES(?,?,?,?,?,?,?,?)"
         cur.execute(q,(now(),TARGET,data["bio"],data["followers"],data["following"],data["posts"],data["profile_pic"],json.dumps(data)))
+
         for url in data["discovered_posts"]:
             shortcode=url.rstrip("/").split("/")[-1]
             cur.execute("SELECT 1 FROM posts WHERE shortcode=%s" if DB_URL else "SELECT 1 FROM posts WHERE shortcode=?",(shortcode,))
@@ -126,8 +159,9 @@ def scan():
                 q="INSERT INTO posts(shortcode,kind,url,first_detected,title) VALUES(%s,%s,%s,%s,%s)" if DB_URL else "INSERT INTO posts(shortcode,kind,url,first_detected,title) VALUES(?,?,?,?,?)"
                 cur.execute(q,(shortcode,kind,url,now(),f"New public {kind} detected"))
                 insert_event(cur,"content",f"New {kind.title()} detected","Original publication timestamp was not exposed; first-detected time is recorded instead.",url)
+
         q="UPDATE scans SET finished_at=%s,status=%s,message=%s WHERE id=%s" if DB_URL else "UPDATE scans SET finished_at=?,status=?,message=? WHERE id=?"
-        cur.execute(q,(now(),"success","Public profile scan completed.",sid))
+        cur.execute(q,(now(),"success","Public profile snapshot refreshed.",sid))
         c.commit(); c.close(); return data
     except Exception as e:
         q="UPDATE scans SET finished_at=%s,status=%s,message=%s WHERE id=%s" if DB_URL else "UPDATE scans SET finished_at=?,status=?,message=? WHERE id=?"
@@ -149,14 +183,23 @@ def overview():
     cur.execute("SELECT shortcode,kind,url,first_detected,original_time,title FROM posts ORDER BY id DESC LIMIT 100")
     posts=cur.fetchall()
     cur.execute("SELECT started_at,finished_at,status,message FROM scans ORDER BY id DESC LIMIT 20")
-    scans=cur.fetchall(); c.close()
+    scans=cur.fetchall()
+    cur.execute("SELECT scanned_at,bio,followers,following,posts,profile_pic FROM snapshots WHERE username="+("%s" if DB_URL else "?")+" ORDER BY id DESC LIMIT 30",(TARGET,))
+    history=cur.fetchall()
+    c.close()
+
     snap=None
-    if row: snap={"scanned_at":row[0],"username":TARGET,"bio":row[1],"followers":row[2],"following":row[3],"posts":row[4],"profile_pic":row[5]}
-    return jsonify({"target":TARGET,"target_url":TARGET_URL,"baseline_reposts":BASELINE_REPOSTS,
+    if row:
+        snap={"scanned_at":row[0],"username":TARGET,"bio":row[1],"followers":row[2],"following":row[3],"posts":row[4],"profile_pic":row[5]}
+
+    return jsonify({
+      "target":TARGET,"target_url":TARGET_URL,"baseline_reposts":BASELINE_REPOSTS,
       "snapshot":snap,
+      "history":[{"scanned_at":x[0],"bio":x[1],"followers":x[2],"following":x[3],"posts":x[4],"profile_pic":x[5]} for x in history],
       "events":[dict(created_at=x[0],kind=x[1],title=x[2],detail=x[3],source_url=x[4]) for x in events],
       "posts":[dict(shortcode=x[0],kind=x[1],url=x[2],first_detected=x[3],original_time=x[4],title=x[5]) for x in posts],
-      "scans":[dict(started_at=x[0],finished_at=x[1],status=x[2],message=x[3]) for x in scans]})
+      "scans":[dict(started_at=x[0],finished_at=x[1],status=x[2],message=x[3]) for x in scans]
+    })
 
 @app.post("/api/scan")
 def manual_scan():
