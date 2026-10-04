@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: instagram-public-monitor
+    runtime: python
+    plan: free
+    region: oregon
+    branch: instagram-monitor
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 60
+    autoDeploy: true
+  - type: cron
+    name: instagram-public-monitor-daily
+    runtime: python
+    schedule: "0 8 * * *"
+    branch: instagram-monitor
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -c "from app import scan; scan()"
+    autoDeploy: true
