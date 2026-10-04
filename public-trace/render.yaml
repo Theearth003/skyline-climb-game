@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: public-trace
+    runtime: python
+    plan: free
+    region: oregon
+    branch: public-trace
+    buildCommand: pip install -r public-trace/requirements.txt
+    startCommand: gunicorn --chdir public-trace app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 60
